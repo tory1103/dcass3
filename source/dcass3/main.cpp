@@ -1,111 +1,81 @@
 #include <curl/curl.h>
+#include <argparse/argparse.hpp>
 #include <iostream>
-#include <cstdio>
 #include <string>
 #include <vector>
 
+#include "../../include/dcass3/filesegmentation.h"
+
 #define WEBHOOK "YOUR_DISCORD_WEBHOOK_URL"
-#define MEGABYTES_SIZE 24000000 // 24MB
 
-typedef struct
+int main(const int argc, char** argv)
 {
-    std::string filename; // Original filename
-    std::vector<char> data; // Data as bytes
-    int bytesize; // Data size in bytes
-    int n_partitions; // bytesize / MEGABYTES_SIZE
-} FILE_METADATA_T;
+    // Parse arguments
+    argparse::ArgumentParser program("dcass3", "1.0");
 
-void delete_partitions(const std::vector<std::string>& partitions_names)
-{
-    for (const auto& filename : partitions_names)
-        remove(filename.c_str());
-}
+    program.add_argument("filename")
+           .help("Filename to send to Discord Webhook or partitions metadata");
 
-void save_partitions_metadata(const FILE_METADATA_T& file_metadata)
-{
-    FILE* fichero = fopen((file_metadata.filename + ".meta").c_str(), "wb");
+    program.add_argument("-m", "--merge-partitions")
+           .help("Merge partitions into a single file and save it to the original filename")
+           .default_value(false)
+           .implicit_value(true);
 
-    // Save filename length and filename value
-    int filename_length = file_metadata.filename.length();
-    fwrite(&filename_length, 4, 1, fichero);
-    fwrite(file_metadata.filename.data(), filename_length, 1, fichero);
+    program.add_argument("-s", "--just-segment")
+           .help("Just segment the file into partitions and save them")
+           .default_value(false)
+           .implicit_value(true);
 
-    // Save bytesize and n_partitions
-    int bytesize_n_partitions[2] = {file_metadata.bytesize, file_metadata.n_partitions};
-    fwrite(bytesize_n_partitions, 4, 2, fichero);
+    program.add_argument("-k", "--keep-partitions")
+           .help("Keep partitions after sending them to Discord Webhook")
+           .default_value(false)
+           .implicit_value(true);
 
-    fclose(fichero);
-}
+    program.add_argument("-w", "--webhook")
+           .help("Discord Webhook URL")
+           .default_value(WEBHOOK)
+           .nargs(1);
 
-FILE_METADATA_T& read_file(const char* filename)
-{
-    // Create file metadata
-    auto* file_data = new FILE_METADATA_T;
-    file_data->filename = std::string(filename);
-    file_data->bytesize = 0;
-    file_data->n_partitions = 0;
-
-    // Read file data
-    FILE* fichero = fopen(filename, "rb");
-
-    // Get file size by moving the cursor to the end of the file and then getting the cursor position
-    fseek(fichero, 0, SEEK_END);
-    file_data->bytesize = ftell(fichero);
-    rewind(fichero);
-
-    // Calculate the number of partitions
-    file_data->n_partitions = file_data->bytesize / MEGABYTES_SIZE;
-
-    // Read file data
-    char byte = 0;
-    while (fread(&byte, 1, 1, fichero)) file_data->data.push_back(byte);
-
-    return *file_data;
-}
-
-std::vector<std::string>& create_file_partitions(const FILE_METADATA_T& file_metadata)
-{
-    // Create filenames vector and save partitions metadata
-    auto* filenames = new std::vector<std::string>;
-    save_partitions_metadata(file_metadata);
-    filenames->push_back(file_metadata.filename + ".meta");
-
-    // Create file partitions
-    for (int i = 0; i < file_metadata.n_partitions; i++)
+    try
     {
-        std::string filename = file_metadata.filename + std::to_string(i);
-        filenames->push_back(filename);
-
-        FILE* fichero = fopen(filename.c_str(), "wb");
-        for (int j = 0; j < MEGABYTES_SIZE; j++) fwrite(&file_metadata.data[i * MEGABYTES_SIZE + j], 1, 1, fichero);
-        fclose(fichero);
+        program.parse_args(argc, argv);
     }
 
-    // Create last partition (rest of the data)
-    std::string filename = file_metadata.filename + std::to_string(file_metadata.n_partitions);
-    filenames->push_back(filename);
+    catch (const std::exception& err)
+    {
+        std::cerr << err.what() << std::endl;
+        std::cerr << program;
+        return 1;
+    }
 
-    FILE* fichero = fopen(filename.c_str(), "wb");
-    for (int i = 0; i < file_metadata.bytesize % MEGABYTES_SIZE; i++) fwrite(&file_metadata.data[file_metadata.n_partitions * MEGABYTES_SIZE + i], 1, 1, fichero);
-    fclose(fichero);
+    // Variables
+    const char* filename = program.get("filename").c_str();
 
-    return *filenames;
-}
+    // Delete partitions
+    if (program["--merge-partitions"] == true)
+    {
+        merge_file_partitions(read_file_metadata(filename));
+        return 0;
+    }
 
-
-int main()
-{
     // Read file and create partitions
-    FILE_METADATA_T file_data = read_file("airbnb.json");
+    const FILE_METADATA_T file_data = read_file(filename);
     const std::vector<std::string> partitions_names = create_file_partitions(file_data);
 
+    if (program["--just-segment"] == true) return 0;
+
     // Send partitions to Discord Webhook
-    int actual_partition = 0;
+    int actual_partition = 0, exit_code = 0;
     for (const auto& partition_name : partitions_names)
     {
         // Initialize curl
         CURL* curl = curl_easy_init();
-        if (!curl) break;
+        if (!curl)
+        {
+            std::cerr << "curl_easy_init() failed" << std::endl;
+            exit_code = 2;
+            break;
+        }
 
         curl_global_init(CURL_GLOBAL_ALL);
 
@@ -121,7 +91,7 @@ int main()
         curl_mime_filedata(part, partition_name.c_str());
 
         // Configure POST request with MIME form
-        curl_easy_setopt(curl, CURLOPT_URL, WEBHOOK);
+        curl_easy_setopt(curl, CURLOPT_URL, program.get("--webhook").c_str());
         curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
 
         // Realize the request
@@ -134,7 +104,8 @@ int main()
     }
 
     // Delete partitions
-    delete_partitions(partitions_names);
+    if (program["--keep-partitions"] == false)
+        delete_partitions(partitions_names);
 
-    return 0;
+    return exit_code;
 }

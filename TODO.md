@@ -5,6 +5,7 @@
 - [x] Uploading partitions to Discord Webhook
 
 # v1
-- [ ] CLI arguments
+- [x] CLI arguments
+- [x] File merge using metadata
 - [ ] Maybe config file for multiple Webhooks?
 - [ ] README.md
